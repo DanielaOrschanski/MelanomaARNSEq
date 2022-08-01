@@ -1,0 +1,488 @@
+---
+title: "MelanomaAnalysis"
+output: html_document
+date: '2022-04-25'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r DESq2}
+BiocManager::install("ArrayExpress")
+BiocManager::install("DESeq2")
+library("DESeq2")
+install.packages("data.table")
+library(data.table)
+BiocManager::install("org.Hs.eg.db")
+library(org.Hs.eg.db)
+
+#1. Import the count matrix:----
+#Import database from text(base), heading: yes, row names: use first column, change the name for "Count_matrix"
+
+count_matrix_Melanoma <- read.delim(here::here(datadir,  "GSE158403_FPKM_matrix.txt.gz"), row.names=1)
+
+#The rows are the features (genes) and the columns are the samples
+#If I see a gene whose values are closer to 0 this means that it is lowly expressed
+#If I see a gene whose values are closer to 200, 100, 300 it means it is quiet expressed
+#Highly expressed genes have values of 50 000 for example
+
+
+
+#2. Read the sdrf file: Sample annotation----
+
+BiocManager::install("GEOquery")
+library(GEOquery)
+sample_annotation <- getGEO("GSE158403",GSEMatrix=FALSE)
+
+
+sample_annotation_Melanoma <- getGEO(filename=("~/MelanomaProject/data/GSE158403_series_matrix.txt.gz"))
+View(sample_annotation_Melanoma)
+sample_annotation_Melanoma_DF<- as.data.frame(sample_annotation_Melanoma)
+
+
+```
+
+```{r Process Sample Annotation}
+
+#3. Process the sample annotation file so that the rows matches the columns of the samples in the count matrix
+  #Saved it as an excel file so that we can change the "-" for "."
+  #We will delete the columns that contain the same information for every row
+ 
+
+sample_annotation_Melanoma %>%
+  rio::export(here::here(datadir, "Melanoma_SA.xlsx"))
+
+#Import the adapted sample annotation file
+SA_Melanoma<- rio::import(here::here(datadir, "Melanoma_SA_T.xlsx"))
+
+#Convert into factors the features we will analyze:
+SA_Melanoma$braf_mutation<- as.factor(SA_Melanoma$braf_mutation) 
+class(SA_Melanoma$braf_mutation)
+SA_Melanoma$treatment<- as.factor(SA_Melanoma$treatment) 
+SA_Melanoma$cohort<- as.factor(SA_Melanoma$cohort) 
+
+```
+
+```{r Feature Annotation}
+
+#4. Construct a feature annotation based on the id type, in this case is symbol:
+install.packages(tibble)
+install.packages(dplyr)
+library(tibble)
+library(dplyr)
+
+  #4.1. Make the title of the samples the names of the rows
+rownames(SA_Melanoma) <- SA_Melanoma$title
+
+
+feature_annotation <- AnnotationDbi::select(org.Hs.eg.db, columns= c("SYMBOL", "GENENAME","ENTREZID"), keys= keys(org.Hs.eg.db)) %>%
+   group_by(SYMBOL) %>% #we are grouping by symbol
+  summarise(ENTREZID= paste(unique(ENTREZID), collapse= ","),
+            GENENAME= paste(unique(GENENAME), collapse=",")) %>%
+  
+  #4.2. Define a rowname to the id type
+  mutate(rowname= SYMBOL) %>%
+  column_to_rownames 
+  
+
+```
+
+```{r Matching}
+#5. Reorder the columns and rows:
+
+#5.1. Reorder the sample annotation so the order in the count matrix matches
+  #we make sure that the SA are ordered in the same way as the samples(columns) in the count matrix
+SA_Melanoma<- SA_Melanoma[colnames(count_matrix_Melanoma),]
+
+#5.2. Define the order of the features
+#count_matrix_Melanoma<- count_matrix_Melanoma[rownames(feature_annotation),] #This may not work as we want, so we have to do:
+selected<- intersect(rownames(count_matrix_Melanoma), rownames(feature_annotation))
+View(selected)
+
+```
+
+```{r DESeq2DataSet}
+
+#6. Construct a DESeq2DataSet with an ordered count matrix and sample annotation
+
+#Function DESeqDataSet: stores the input values, intermediate calculations and results of an analysis of differential expression
+#Generation of counts or estimated counts for each sample
+  # count matrix called cts 
+  # table of sample information called coldata. 
+  # The design indicates how to model the samples. This factor/s should be columns of the sample annotation
+
+#dds <- DESeqDataSetFromMatrix(countData = count_matrix_Melanoma,
+                              #colData = SA_Melanoma,
+                              #design= ~cohort) #the feature we will analyze 
+
+#If we have done the "selected" in the previous step:
+
+dds <- DESeqDataSetFromMatrix(countData = round(count_matrix_Melanoma[selected,]),
+                              colData = SA_Melanoma,
+                              rowData= feature_annotation[selected,],
+                              design= ~cohort) #how the counts for each gene depend on the variables in colData.
+
+
+
+#Save the DESeq2 object
+dds%>%
+    rio::export(here::here(datadir, "Melanoma_DESeqDataSet.RDS")) 
+
+```
+
+
+```{r DESeqAnalysis}
+
+#Now we are interested in diferentially expressed genes
+
+library(DESeq2)
+#1. Load the dds object
+dds <- rio::import(here::here(datadir, "Melanoma_DESeqDataSet.RDS"))
+
+
+#2. Filter lowly expressed genes
+  #constructs a logical vector with all the genes over all samples that have more than 10 counts
+  #So this will filtrate the genes which values in the count matrix are close to 0, because this genes do not contain any information and are most likely background noise.
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+
+ 
+#3. Calculates and analyze factors
+
+dds <- DESeq(dds)
+#Estimating size factors: Normalize the size of libraries
+#estimate the gene-wise dispersion: distribution of the gene expression. For example: we have 10 reads in one sample and 20 reads in another sample, so the spread of the distribution would be 20-10 = 10.
+#Fitting model and testing: linear model determined by the element we wrote in the design of the dds object (cohort in this case). Calculates automatically the design matrix and fits the linear model based on binomial distributions to the data. And finally tests the model gene-wise if the coefficients of the linear model are different from 0 or not.
+
+  
+#5. Extract the results:
+res <- results(dds)
+results <- res %>%
+  data.frame()
+
+sum(is.na(results))
+colSums(is.na(results))
+
+sum(is.na(SA_Melanoma))
+colSums(is.na(SA_Melanoma))
+
+
+  #the rows names are the symbols of the genes
+  #lfcSE: Is the standanrd error of the log2FoldChange
+  #stats: statistics
+  #pvalue: #pvalue: if it is closer to 0 it means that the expression of the genes in one cohort is similar to the expression of the genes in the other cohort we are comparing with
+  #padj: adjusted p value
+
+#6. Build the Contrasts:
+#Compare the 3 status of the cohort possible: A, B or C
+contrasts <- list(A_vs_B = c("cohort","A","B"),
+                  B_vs_C = c("cohort","B","C"),
+                  A_vs_C = c("cohort","A","C"))
+
+#7. Results with the contrasts
+res <- contrasts %>%
+  purrr::map(DESeq2::results,
+             object = dds)
+
+res$A_vs_B #contains the results for the cohort A in comparisson to cohort B
+res$B_vs_C
+res$A_vs_C
+
+#8. This results do not have the feature annotation, so we extract the feature annotation from the dds object:
+
+feature_annotation <- rowData(dds) %>%
+  data.frame %>%
+  dplyr::select(ENTREZID, SYMBOL, GENENAME) #We extract the variables that will be used for the results
+
+#9. Results with feature annotation
+res <- res %>%
+  purrr::map(function(x){
+    x %>%
+      data.frame %>%
+      rownames_to_column("SYMBOL") %>%
+      inner_join(feature_annotation)
+  })
+
+res$A_vs_B 
+res$B_vs_C
+res$A_vs_C
+
+#10. Save the results
+res %>%
+  rio::export(here::here(resultsdir, "Melanoma_DEGs.xlsx"))
+#it was stored on the folder called "results"
+#if we open it we will see an excel with 3 slides, each one for one comparison. 
+
+#The less padj they have in one slide the more similar in regards of changes in gene expression. s
+ 
+#Conviene buscar los genenames para hacer alguna acotación, por ejemplo que el CC3 es para la inflamacion
+
+```
+
+```{r GSVA}
+#Now we are also interested in diferentially regulated pathways
+
+BiocManager::install("GSVA")
+library(GSVA)
+library(msigdbr) #molecular signature data base
+library(Biobase)
+dds <- rio::import(here::here(datadir, "Melanoma_DESeqDataSet.RDS"))
+
+#1. Filter lowly expressed genes
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+dds
+#2. Extract the count matrix
+counts_matrix <- counts(dds)
+
+
+#3. Extract the molecular signature database:
+
+    #Is a database that is maintained by the Broad Institute of the University of California in San Diego
+    #Is a very comprehensive collection of gene sets which contains 8 categories:
+    #- hallmark gene sets
+    #- positional gene sets
+    #- curated
+    #- regulatory target
+    #- computational
+    #- entology
+    #- encogenic signature
+    #- inmunologic signature
+    #- cell type signature gene sets
+  
+  #Each category have genes associated with different pathways
+ 
+
+msigdb <- msigdbr()
+msigdb
+#This is dataframe that contains:
+  #- category: H,C1,C2,C3,C4,C5,C6,C7,C8
+  #- subcategory
+  #- gene set name
+  #- Each row is one gene
+
+#4. Create a term to gene map which contains the symbol and the gs id
+term2gene <- msigdb %>%
+  dplyr::select(gs_id, gene_symbol) %>% #entrez_gene
+  tidyr::nest(gg = -"gs_id") %>% 
+  deframe %>% 
+  purrr::map(deframe)#convert it into a character vector
+term2gene
+
+
+#5. Create a term to name map which contains the category, subcategory, name and exact source
+
+term2name <- msigdb %>%
+  dplyr::select(gs_id, gs_cat, gs_subcat, gs_name, gs_exact_source) %>% 
+  distinct %>%
+  dplyr::mutate(rowname = gs_id) %>%
+  column_to_rownames()
+
+
+#6.Transform the count matrix into a gene set variation score matrix. Or gene set expression matrix
+
+  #This score determines if the genes of the gene set are grouped more at the top or more at the button of the gene expression vector
+  #The absolut value of this score is the more distinct is the concentration of the genes of top or button of the sample. 
+  #If a gene is around 0 means that the gene set are distributed roughly equally accross the gene expression vector.
+  #The value -0,25 indicates that there is a accumulation of genes at the button
+count_matrix_Melanoma_mat <- as.matrix(count_matrix_Melanoma)
+
+gsva_matrix <- gsva(count_matrix_Melanoma_mat,
+                    gset.idx.list = term2gene,
+                    kcdf = c("Poisson")) #poisson distribution because we are dealing with counts. It is a binomial distribution base and it is used for variables that are discrete.
+#in proteomics or microarray we would use a distribution for continuous variables such as Gaussian
+ 
+
+gsva_matrix %>%
+  rio::export(here::here(datadir, "gsva_matrix.RDS"))
+
+View(head(gsva_matrix))
+
+#this gene set expression matrix can now be analyzed completely by using linear models
+
+#7. Construct an expression set:
+gsva_eset <- ExpressionSet(gsva_matrix)
+fData(gsva_eset) <- term2name[featureNames(gsva_eset),]
+pData(gsva_eset) <- colData(dds) %>%
+  data.frame
+
+gsva_eset
+ 
+
+#8. Which pathways are differentialy regulated between the different conditions
+design <- model.matrix(~0+cohort, 
+                       data = pData(gsva_eset))
+#gsva_eset$cohort is what we want to analyze
+ 
+install.packages("stringr")
+library(stringr)
+colnames(design) <- str_replace(colnames(design), "cohort", "")
+
+View(design)
+ 
+BiocManager::install("limma")
+library("limma")
+contrasts <- makeContrasts(A_vs_B = A - B,
+                           B_vs_C = B - C,
+                           A_vs_C = A - C,
+                           levels = design)
+
+ contrasts
+
+fit <- gsva_eset %>%
+  lmFit(design = design) %>%
+  contrasts.fit(contrasts = contrasts) %>%
+  eBayes
+
+library(purrr)
+coefs <- colnames(contrasts) %>%
+  set_names(.,.)
+
+ 
+
+res <- coefs %>%
+  purrr::map(function(x){
+    topTable(fit, 
+             coef = x, 
+             number = Inf)})
+
+
+res %>%
+  rio::export(here::here(resultsdir, "Melanoma_GSVA.xlsx"))
+
+#open the excel file:
+#gs_name indicates biological functions that are differentially regulated in BD_vs_control for example. If the logFC is -0,23 means that function is down regulated
+#The higher the p values are for one slide the less difference is between the 2 compared status of cohort in regards of changes in the differentially expressed are the pathways. The B_vs_C has the higher p values so in terms of differentially expressed pathways the cohort B and the cohort C are not so different
+
+
+```
+
+```{r Visualization}
+#1. Standard differential expression analysis 
+dds<- DESeq(dds)
+res_v<- results(dds)
+res_v
+  #results table with base mean, log2 fold changes, p values and adjusted p values
+
+BiocManager::install("apeglm")
+library(apeglm)
+
+#2. 3 Methods for effect size shrinkage:----
+  #a. Apeglm: is the adaptive t prior shrinkage estimator
+resultsNames(dds)
+resLFC<- lfcShrink(dds, coef="cohort_B_vs_A", type="apeglm")
+resLFC
+plotMA(resLFC, ylim=c(-2, 2))
+
+resLFC<- lfcShrink(dds, coef="cohort_C_vs_A", type="apeglm")
+plotMA(resLFC, ylim=c(-2, 2))
+
+  #b. Ashr: is the adaptive shrinkage estimator
+install.packages("ashr")
+library(ashr)
+resLFC<- lfcShrink(dds, coef="cohort_C_vs_A", type="ashr")
+?lfcShrink
+plotMA(resLFC, ylim=c(-2, 2))
+
+resLFC<- lfcShrink(dds, coef="cohort_B_vs_A", type="ashr")
+plotMA(resLFC, ylim=c(-2, 2))
+
+  #c.Normal: is the the original DESeq2 shrinkage estimator, an adaptive Normal distribution as prior
+resLFC<- lfcShrink(dds, coef="cohort_C_vs_A", type="normal")
+plotMA(resLFC, ylim=c(-2, 2))
+
+resLFC<- lfcShrink(dds, coef="cohort_B_vs_A", type="normal")
+plotMA(resLFC, ylim=c(-2, 2))
+  
+  #the function plotMA shows the log2 fold changes attributable to a given variable over the mean of normalized counts for all the samples in the DESeqDataSet. 
+  #Points will be colored red if the adjusted p value is less than 0.1. 
+  #Points which fall out of the window are plotted as open triangles pointing either up or down.
+
+
+#3. Examine the counts of reads for a single gene across the groups:----
+  #The counts are grouped by the variables in intgroup
+  #Is the gene which had the smallest p value from the results table: LY6G6C 
+plotCounts(dds, gene=which.min(res_v$padj), intgroup="cohort") 
+plotCounts(dds, gene=which.min(res_v$padj), intgroup="braf_mutation")
+res_v@rownames
+
+
+#4. Count data transformations
+  #These transformation functions return an object of class DESeqTransform which is a subclass of RangedSummarizedExperiment. The point of these two transformations, the VST and the rlog, is to remove the dependence of the variance on the mean, particularly the high variance of the logarithm of count data when the mean is low
+
+  # By setting blind to FALSE, the dispersions already estimated will be used to perform transformations, or if not present, they will be estimated using the current design formula. Takes less time
+  
+  #a. Variance stabilizing transformations:
+      # The transformed data should be approximated variance stabilized and also includes correction for size factors or normalization factors
+vsd <- vst(dds, blind=FALSE)
+
+  #b. Regularized logarithm:
+      #transforming the original count data to the log2 scale by fitting a model with a term for each sample and a prior distribution on the coefficients which is estimated from the data.
+rld <- rlog(dds, blind=FALSE) 
+#head(assay(vsd), 3)
+
+  #c. Normal transformation:
+ntd <- normTransform(dds)
+install.packages("vsn")
+library("vsn")
+
+meanSdPlot(assay(ntd))
+meanSdPlot(assay(vsd))
+rd(assay(rld))
+?meanSdPlot
+
+# plots the standard deviation of the transformed data, across samples, against the mean, using the shifted logarithm transformation, the regularized log transformation and the variance stabilizing transformation. 
+
+# The scatterplot of sd versus mean of rows allows you to visually verify whether there is a dependence of the standard deviation (or variance) on the mean. 
+# The red line depicts the running median estimator (window-width 10%). If there is no variance-mean dependence, then the line should be approximately horizontal.
+
+#5. Heatmap of the count matrix
+#install.packages("pheatmap")
+library("pheatmap")
+select <- order(rowMeans(counts(dds,normalized=TRUE)),
+                decreasing=TRUE)[1:20]
+df <- as.data.frame(colData(dds)[,c("cohort","braf_mutation")])
+pheatmap(assay(ntd)[select,], cluster_rows=FALSE, show_rownames=FALSE,
+         cluster_cols=FALSE, annotation_col=df)
+
+
+#6. Heatmap of the sample-to-sample distances:
+  #A heatmap of this distance matrix gives us an overview over similarities and dissimilarities between samples
+
+#install.packages("SummarizedExperiment")
+library(SummarizedExperiment)
+#install.packages("RColorBrewer")
+library("RColorBrewer")
+#install.packages("pheatmap")
+library(pheatmap)
+
+sampleDists <- dist(t(assay(vsd)))
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(vsd$cohort, sep="-")
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+?pheatmap
+
+#7. Principal component plot of the samples: 
+  #This type of plot is useful for visualizing the overall effect of experimental covariates and batch effects.
+plotPCA(vsd, intgroup=c("cohort", "braf_mutation"))
+?plotPCA
+vsd
+
+
+#8. Boxplots
+par(mar=c(8,5,2,2))
+boxplot(log10(assays(dds)[["cooks"]]), range=0, las=2)
+#The DESeq function calculates, for every sample, a diagnostic test for outliers called Cook’s distance: is a measure of how much a single sample is influencing the fitted coefficients for a gene. A large value of Cook’s distance is intended to indicate an outlier count. 
+
+```
+
+
+
+
